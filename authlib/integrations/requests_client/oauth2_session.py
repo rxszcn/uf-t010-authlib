@@ -138,15 +138,26 @@ class OAuth2Session(OAuth2Client, Session):
         if self.default_timeout:
             kwargs.setdefault("timeout", self.default_timeout)
         if not withhold_token and auth is None:
-            if not self.token:
-                token_endpoint = self.metadata.get("token_endpoint")
-                grant_type = self.metadata.get("grant_type")
-                if grant_type == "client_credentials" and token_endpoint:
-                    self.fetch_token(
-                        token_endpoint,
-                        grant_type="client_credentials",
-                    )
-                else:
-                    raise MissingTokenError()
+            self._ensure_initial_token()
             auth = self.token_auth
         return super().request(method, url, auth=auth, **kwargs)
+
+    def _ensure_initial_token(self):
+        """Fetch a missing token for a configured client-credentials grant.
+
+        The double-checked locking mirrors the async client: concurrent first
+        requests fetch the token only once, while later requests skip the
+        lock entirely once a token is present.
+        """
+        if self.token:
+            return
+        token_endpoint = self.metadata.get("token_endpoint")
+        grant_type = self.metadata.get("grant_type")
+        if grant_type != "client_credentials" or not token_endpoint:
+            raise MissingTokenError()
+        with self._token_refresh_lock:
+            if not self.token:
+                self.fetch_token(
+                    token_endpoint,
+                    grant_type="client_credentials",
+                )

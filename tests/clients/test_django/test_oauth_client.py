@@ -538,3 +538,75 @@ def test_validate_logout_response_invalid_state(factory):
     request.session = factory.session
     with pytest.raises(OAuthError, match='Invalid "state" parameter'):
         client.validate_logout_response(request)
+
+
+def test_concurrent_requests_refresh_token_once(factory):
+    """Concurrent Django requests sharing one remote app refresh once."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from threading import Event
+
+    storage = {
+        "access_token": "expired-a",
+        "refresh_token": "expired-b",
+        "token_type": "Bearer",
+        "expires_at": 100,
+    }
+
+    def fetch_token(name, request):
+        return dict(storage)
+
+    def update_token(name, token, refresh_token=None, access_token=None):
+        storage.update(token)
+
+    oauth = OAuth(fetch_token=fetch_token, update_token=update_token)
+    client = oauth.register(
+        "dev",
+        client_id="dev",
+        client_secret="dev",
+        api_base_url="https://resource.test/api",
+        access_token_url="https://provider.test/token",
+        refresh_token_url="https://provider.test/token",
+        authorize_url="https://provider.test/authorize",
+    )
+
+    refresh_count = {"n": 0}
+    fetch_started = Event()
+
+    def fake_send(sess, req, **kwargs):
+        if req.url == "https://provider.test/token":
+            refresh_count["n"] += 1
+            fetch_started.set()
+            time.sleep(0.2)
+            assert "refresh_token=expired-b" in req.body
+            return mock_send_value(
+                {
+                    "token_type": "Bearer",
+                    "access_token": "fresh-a",
+                    "refresh_token": "fresh-b",
+                    "expires_at": int(time.time()) + 3600,
+                }
+            )
+        resp = mock.MagicMock()
+        resp.text = "hi"
+        resp.status_code = 200
+        return resp
+
+    workers = 8
+    start = Barrier(workers)
+
+    def worker(index):
+        request = factory.get("/login")
+        start.wait()
+        if index != 0:
+            fetch_started.wait()
+        return client.get("/api/user", request=request)
+
+    with mock.patch("requests.sessions.Session.send", fake_send):
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            responses = list(pool.map(worker, range(workers)))
+
+    assert refresh_count["n"] == 1
+    assert all(resp.status_code == 200 for resp in responses)
+    assert storage["access_token"] == "fresh-a"
+    assert storage["refresh_token"] == "fresh-b"

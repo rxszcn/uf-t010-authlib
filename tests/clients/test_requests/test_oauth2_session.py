@@ -1,5 +1,8 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from threading import Barrier
+from threading import Event
 from unittest import mock
 
 import pytest
@@ -934,3 +937,235 @@ def test_list_parameters(token):
         params = url_decode(sent)
         assert [value for key, value in params if key == "resource"] == ["a", "b"]
         assert [value for key, value in params if key == "audience"] == ["c"]
+
+
+def _concurrent_refresh_session(fetch_started):
+    """Build a session whose expired token triggers a slow, blocking refresh."""
+    refreshed_token = {
+        "token_type": "Bearer",
+        "access_token": "fresh-access",
+        "refresh_token": "fresh-refresh",
+        "expires_at": int(time.time()) + 3600,
+    }
+    old_token = dict(
+        access_token="old-access",
+        refresh_token="old-refresh",
+        token_type="bearer",
+        expires_at=100,
+    )
+    sess = OAuth2Session(
+        "foo",
+        token=old_token,
+        token_endpoint="https://provider.test/token",
+    )
+
+    refresh_count = {"n": 0}
+
+    def fake_send(r, **kwargs):
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        if r.url == "https://provider.test/token":
+            refresh_count["n"] += 1
+            # Release the followers only after the leader holds the refresh
+            # lock, then keep holding it so they deterministically take the
+            # double-checked skip instead of racing on scheduler timing.
+            fetch_started.set()
+            time.sleep(0.2)
+            resp.json = lambda: refreshed_token
+        else:
+            resp.json = lambda: {"ok": True}
+        return resp
+
+    sess.send = fake_send
+    return sess, refresh_count
+
+
+def _run_workers(workers, fetch_started, action):
+    start = Barrier(workers)
+
+    def worker(index):
+        start.wait()
+        if index != 0:
+            fetch_started.wait()
+        return action()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(worker, range(workers)))
+
+
+def test_concurrent_refresh_rotates_refresh_token_once():
+    """N concurrent requests on an expired token trigger a single refresh."""
+    fetch_started = Event()
+    sess, refresh_count = _concurrent_refresh_session(fetch_started)
+    workers = 8
+
+    results = _run_workers(
+        workers, fetch_started, lambda: sess.get("https://resource.test/user")
+    )
+
+    assert refresh_count["n"] == 1
+    assert all(resp.status_code == 200 for resp in results)
+    # The whole session ends on the rotated token, never the stale one.
+    assert sess.token["access_token"] == "fresh-access"
+    assert sess.token["refresh_token"] == "fresh-refresh"
+
+
+def test_concurrent_refresh_never_restores_stale_token():
+    """A losing request must not write the rotated-away token back.
+
+    This reproduces the reported logout storm: without serialization the
+    refresh token is rotated once and every parallel refresh afterwards fails
+    with invalid_grant.
+    """
+    workers = 8
+    fetch_started = Event()
+    sess, _ = _concurrent_refresh_session(fetch_started)
+
+    _run_workers(workers, fetch_started, lambda: sess.get("https://resource.test/user"))
+
+    assert sess.token["refresh_token"] == "fresh-refresh"
+    assert "old-refresh" not in sess.token.values()
+
+
+def test_concurrent_initial_client_credentials_fetch_once(token):
+    """Concurrent first requests fetch the client-credentials token once."""
+    fetch_started = Event()
+    fetch_count = {"n": 0}
+    token_url = "https://provider.test/token"
+    resource_url = "https://resource.test/user"
+
+    def fake_send(r, **kwargs):
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        if r.url == token_url:
+            fetch_count["n"] += 1
+            fetch_started.set()
+            time.sleep(0.2)
+            resp.json = lambda: token
+        else:
+            resp.json = lambda: {"ok": True}
+        return resp
+
+    sess = OAuth2Session(
+        client_id="foo",
+        client_secret="bar",
+        token_endpoint=token_url,
+        grant_type="client_credentials",
+    )
+    sess.send = fake_send
+
+    workers = 8
+    results = _run_workers(workers, fetch_started, lambda: sess.get(resource_url))
+
+    assert fetch_count["n"] == 1
+    assert all(resp.status_code == 200 for resp in results)
+
+
+def test_failed_refresh_does_not_corrupt_token_for_other_threads(token):
+    """If the single refresh fails, no thread overwrites storage with a token
+    carrying a dead refresh token; later attempts can still retry cleanly."""
+    fetch_started = Event()
+    old_token = dict(
+        access_token="old-access",
+        refresh_token="old-refresh",
+        token_type="bearer",
+        expires_at=100,
+    )
+    sess = OAuth2Session(
+        "foo",
+        token=old_token,
+        token_endpoint="https://provider.test/token",
+    )
+
+    def fake_send(r, **kwargs):
+        if r.url == "https://provider.test/token":
+            fetch_started.set()
+            time.sleep(0.1)
+            resp = requests.Response()
+            resp.status_code = 400
+            resp._content = b'{"error": "invalid_grant"}'
+            resp.url = r.url
+            return resp
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        return resp
+
+    sess.send = fake_send
+    workers = 4
+    start = Barrier(workers)
+
+    def worker(index):
+        start.wait()
+        if index != 0:
+            fetch_started.wait()
+        with pytest.raises(OAuthError):
+            sess.get("https://resource.test/user")
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(worker, range(workers)))
+
+    # The original token object is still what the session holds.
+    assert sess.token["refresh_token"] == "old-refresh"
+
+
+def test_lock_is_reentrant_on_same_thread():
+    """Acquiring the refresh lock twice on one thread must not deadlock."""
+    sess = OAuth2Session(
+        "foo",
+        token=dict(access_token="a", token_type="bearer", expires_at=100),
+        token_endpoint="https://provider.test/token",
+    )
+    with sess._token_refresh_lock:
+        with sess._token_refresh_lock:
+            assert True
+
+
+def test_core_ensure_active_token_refreshes_once_under_contention():
+    """The core lock (shared by the requests session) refreshes once.
+
+    ``refresh_token`` is mocked so the double-checked locking is exercised
+    directly, without any HTTP transport or scheduler-dependent stack.
+    """
+    old_token = dict(
+        access_token="old-access",
+        refresh_token="old-refresh",
+        token_type="bearer",
+        expires_at=100,
+    )
+    sess = OAuth2Session(
+        "foo",
+        token=old_token,
+        token_endpoint="https://provider.test/token",
+    )
+    fresh_token = dict(
+        access_token="fresh-access",
+        refresh_token="fresh-refresh",
+        token_type="bearer",
+        expires_at=int(time.time()) + 3600,
+    )
+    fetch_started = Event()
+    refresh = mock.Mock()
+
+    def fake_refresh(url, refresh_token=None):
+        fetch_started.set()
+        time.sleep(0.2)
+        sess.token = fresh_token
+        refresh(url, refresh_token=refresh_token)
+
+    sess.refresh_token = fake_refresh
+
+    workers = 8
+    start = Barrier(workers)
+
+    def worker(index):
+        start.wait()
+        if index != 0:
+            fetch_started.wait()
+        return sess.ensure_active_token(sess.token)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(worker, range(workers)))
+
+    assert refresh.call_count == 1
+    assert all(result is True for result in results)
+    assert sess.token["refresh_token"] == "fresh-refresh"

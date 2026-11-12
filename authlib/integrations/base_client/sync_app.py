@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 
 from authlib.common.security import generate_token
@@ -226,6 +227,14 @@ class OAuth2Base:
         self._register_kwargs = kwargs
         self.server_metadata = dict(kwargs)
 
+        # Framework apps are shared across requests while a fresh HTTP session
+        # is built per request, so the per-session refresh lock cannot protect
+        # concurrent requests. This app-level lock serializes the whole
+        # check-and-refresh sequence. It is reentrant so an ``update_token``
+        # callback that issues another request on the same thread cannot
+        # self-deadlock.
+        self._token_refresh_lock = threading.RLock()
+
     def _on_update_token(self, token, refresh_token=None, access_token=None):
         raise NotImplementedError()
 
@@ -332,7 +341,35 @@ class OAuth2Mixin(_RequestMixin, OAuth2Base):
     def request(self, method, url, token=None, **kwargs):
         self.load_server_metadata()
         with self._get_oauth_client() as session:
+            # Only the check-and-refresh sequence is serialized; the actual
+            # resource request below runs outside the lock so requests stay
+            # concurrent. A fresh session is built per request, so a thread
+            # that waited on the lock re-reads the token from storage and
+            # observes the rotation performed by its predecessor.
+            token = self._ensure_locked_token(session, token, kwargs)
             return self._send_token_request(session, method, url, token, kwargs)
+
+    def _ensure_locked_token(self, session, token, kwargs):
+        request = kwargs.get("request")
+        if kwargs.get("withhold_token"):
+            return token
+
+        with self._token_refresh_lock:
+            # Resolve the stored token while holding the lock so each request
+            # observes the most recent rotation performed by another thread.
+            if token is None:
+                token = self._get_requested_token(request)
+            if token is None:
+                raise MissingTokenError()
+
+            session.token = token
+            # Serialized by the app lock; this refreshes once and writes the
+            # rotated token back to shared storage through ``_on_update_token``.
+            session.ensure_active_token(session.token)
+            # Return the session's live token. Reusing the original reference
+            # would overwrite the refreshed token with the stale one and
+            # trigger a second, failing refresh during request signing.
+            return session.token
 
     def load_server_metadata(self):
         if self._server_metadata_url and "_loaded_at" not in self.server_metadata:

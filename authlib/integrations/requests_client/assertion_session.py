@@ -12,7 +12,7 @@ class AssertionAuth(OAuth2Auth):
         if self.client and (
             not self.token or self.token.is_expired(self.client.leeway)
         ):
-            return self.client.refresh_token()
+            return self.client.ensure_active_token()
 
 
 class AssertionSession(AssertionClient, Session):

@@ -121,7 +121,7 @@ class AssertionClient(_AssertionClient, httpx2.Client):
         """Send request with auto refresh token feature."""
         if not withhold_token and auth is USE_CLIENT_DEFAULT:
             if not self.token or self.token.is_expired():
-                self.refresh_token()
+                self.ensure_active_token()
 
             auth = self.token_auth
         return super().request(method, url, auth=auth, **kwargs)

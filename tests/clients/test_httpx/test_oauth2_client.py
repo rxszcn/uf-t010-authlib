@@ -1,5 +1,8 @@
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from threading import Barrier
 from unittest import mock
 
 import httpx2
@@ -669,3 +672,104 @@ def test_repeated_body_parameters():
         assert [value for key, value in params if key == "audience"] == ["c", "d"]
         keys = [key for key, _ in params]
         assert len(set(keys)) == len(keys) - 2
+
+
+def test_sync_httpx_concurrent_refresh_rotates_once():
+    """Concurrent calls refresh an expired token through the lock only once.
+
+    The refresh call itself is mocked, so the double-checked locking is tested
+    in isolation without any HTTP transport or thread pool inside the client.
+    """
+    fresh_token = {
+        "token_type": "Bearer",
+        "access_token": "fresh-access",
+        "refresh_token": "fresh-refresh",
+        "expires_at": int(time.time()) + 3600,
+    }
+    old_token = dict(
+        access_token="old-access",
+        refresh_token="old-refresh",
+        token_type="bearer",
+        expires_at=100,
+    )
+    transport = WSGITransport(MockDispatch({"ok": True}))
+    with OAuth2Client(
+        "foo",
+        token=old_token,
+        token_endpoint="https://provider.test/token",
+        transport=transport,
+    ) as client:
+        fetch_started = threading.Event()
+        refresh = mock.Mock()
+
+        def fake_refresh(url, refresh_token=None):
+            fetch_started.set()
+            # Keep the lock held so the followers block on it and take the
+            # double-checked skip instead of racing on scheduler timing.
+            time.sleep(0.2)
+            client.token = fresh_token
+            refresh(url, refresh_token=refresh_token)
+
+        client.refresh_token = fake_refresh
+
+        workers = 8
+        start = Barrier(workers)
+
+        def worker(index):
+            start.wait()
+            if index != 0:
+                fetch_started.wait()
+            return client.ensure_active_token(client.token)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(worker, range(workers)))
+
+    assert refresh.call_count == 1
+    assert all(result is True for result in results)
+    assert client.token["access_token"] == "fresh-access"
+
+
+def test_sync_httpx_concurrent_initial_token_fetch_once():
+    """Concurrent first requests fetch a client-credentials token once."""
+    transport = WSGITransport(MockDispatch({"ok": True}))
+    with OAuth2Client(
+        "foo",
+        "bar",
+        token_endpoint="https://provider.test/token",
+        grant_type="client_credentials",
+        transport=transport,
+    ) as client:
+        fetch_started = threading.Event()
+        fetch = mock.Mock()
+
+        def fake_fetch(url, grant_type=None):
+            fetch_started.set()
+            time.sleep(0.2)
+            client.token = dict(default_token)
+            fetch(url, grant_type=grant_type)
+
+        client.fetch_token = fake_fetch
+
+        workers = 8
+        start = Barrier(workers)
+
+        def worker(index):
+            start.wait()
+            if index != 0:
+                fetch_started.wait()
+            client._ensure_initial_token()
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(worker, range(workers)))
+
+    assert fetch.call_count == 1
+    assert client.token["access_token"] == default_token["access_token"]
+
+
+def test_sync_httpx_refresh_lock_is_reentrant():
+    """The sync client refresh lock must be reentrant on one thread."""
+    transport = WSGITransport(MockDispatch(default_token))
+    with OAuth2Client("foo", transport=transport) as client:
+        with client._token_refresh_lock:
+            with client._token_refresh_lock:
+                assert True

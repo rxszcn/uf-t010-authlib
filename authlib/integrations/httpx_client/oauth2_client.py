@@ -3,6 +3,7 @@
 # before anyio so import errors refer to httpx.
 from collections.abc import Generator
 from contextlib import asynccontextmanager
+from threading import RLock
 
 from ._compat import httpx2
 from anyio import Lock  # Import after httpx so import errors refer to httpx
@@ -89,10 +90,6 @@ class AsyncOAuth2Client(_OAuth2Client, httpx2.AsyncClient):
         client_kwargs = self._extract_session_request_params(kwargs)
         super(_OAuth2Client, self).__init__(**client_kwargs)
 
-        # We use a Lock to synchronize coroutines to prevent
-        # multiple concurrent attempts to refresh the same token
-        self._token_refresh_lock = Lock()
-
         _OAuth2Client.__init__(
             self,
             session=None,
@@ -108,6 +105,12 @@ class AsyncOAuth2Client(_OAuth2Client, httpx2.AsyncClient):
             leeway=leeway,
             **kwargs,
         )
+
+        # We use an async Lock to synchronize coroutines to prevent multiple
+        # concurrent attempts to refresh the same token. It must be assigned
+        # after ``_OAuth2Client.__init__``, which sets a thread lock for the
+        # sync client sharing this module.
+        self._token_refresh_lock = Lock()
 
     async def _ensure_initial_token(self):
         """Fetch a missing client-credentials token, once per client."""
@@ -249,6 +252,11 @@ class OAuth2Client(_OAuth2Client, httpx2.Client):
         client_kwargs = self._extract_session_request_params(kwargs)
         super(_OAuth2Client, self).__init__(**client_kwargs)
 
+        # A reentrant lock synchronizes threads to prevent multiple
+        # concurrent attempts to refresh the same token. It mirrors the
+        # anyio Lock used by the async client.
+        self._token_refresh_lock = RLock()
+
         _OAuth2Client.__init__(
             self,
             session=self,
@@ -278,7 +286,34 @@ class OAuth2Client(_OAuth2Client, httpx2.Client):
             or not token_endpoint
         ):
             raise MissingTokenError()
-        self.fetch_token(token_endpoint, grant_type="client_credentials")
+        with self._token_refresh_lock:
+            if not self.token:
+                self.fetch_token(token_endpoint, grant_type="client_credentials")
+
+    def ensure_active_token(self, token=None):
+        # Re-read the live token under the lock, like the async client, so a
+        # thread that waited on another refresh reuses the new token and does
+        # not rotate the refresh token a second time.
+        with self._token_refresh_lock:
+            token = self.token or token
+            if not token.is_expired(leeway=self.leeway):
+                return True
+
+            refresh_token = token.get("refresh_token")
+            url = self.metadata.get("token_endpoint")
+            if refresh_token and url:
+                self.refresh_token(url, refresh_token=refresh_token)
+                return True
+
+            if self.metadata.get("grant_type") != "client_credentials":
+                raise InvalidTokenError()
+
+            access_token = token["access_token"]
+            new_token = self.fetch_token(url, grant_type="client_credentials")
+            if self.update_token:
+                self.update_token(new_token, access_token=access_token)
+
+            return True
 
     def request(
         self, method, url, withhold_token=False, auth=USE_CLIENT_DEFAULT, **kwargs

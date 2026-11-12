@@ -1,3 +1,5 @@
+import threading
+
 from authlib.common.encoding import to_unicode
 from authlib.common.security import generate_token
 from authlib.common.urls import url_decode
@@ -168,6 +170,12 @@ class OAuth2Client:
         self._auth_methods = {}
 
         self.leeway = leeway
+
+        # Synchronizes threads to prevent multiple concurrent attempts to
+        # refresh the same token. A reentrant lock keeps nested calls, such
+        # as a client-credentials fetch triggered while another refresh is in
+        # progress on the same thread, free of self-deadlock.
+        self._token_refresh_lock = threading.RLock()
 
     def register_client_auth_method(self, auth):
         """Extend client authenticate for token endpoint.
@@ -386,21 +394,26 @@ class OAuth2Client:
         )
 
     def ensure_active_token(self, token=None):
-        if token is None:
-            token = self.token
-        if not token.is_expired(leeway=self.leeway):
-            return True
-        refresh_token = token.get("refresh_token")
-        url = self.metadata.get("token_endpoint")
-        if refresh_token and url:
-            self.refresh_token(url, refresh_token=refresh_token)
-            return True
-        elif self.metadata.get("grant_type") == "client_credentials":
-            access_token = token["access_token"]
-            new_token = self.fetch_token(url, grant_type="client_credentials")
-            if self.update_token:
-                self.update_token(new_token, access_token=access_token)
-            return True
+        # The whole check-and-refresh sequence runs under a lock so that
+        # concurrent requests cannot rotate the same refresh token twice.
+        # Re-reading ``self.token`` under the lock lets waiting threads reuse
+        # the token another thread has just refreshed instead of refreshing
+        # again: one rotation triggers at most one real refresh.
+        with self._token_refresh_lock:
+            token = self.token or token
+            if not token.is_expired(leeway=self.leeway):
+                return True
+            refresh_token = token.get("refresh_token")
+            url = self.metadata.get("token_endpoint")
+            if refresh_token and url:
+                self.refresh_token(url, refresh_token=refresh_token)
+                return True
+            elif self.metadata.get("grant_type") == "client_credentials":
+                access_token = token["access_token"]
+                new_token = self.fetch_token(url, grant_type="client_credentials")
+                if self.update_token:
+                    self.update_token(new_token, access_token=access_token)
+                return True
 
     def revoke_token(
         self,

@@ -232,3 +232,58 @@ def test_access_token_params(token):
     assert [v for k, v in params if k == "grant_type"] == [
         "urn:ietf:params:oauth:grant-type:jwt-bearer"
     ]
+
+
+def test_concurrent_assertion_refresh_once(token):
+    """Concurrent requests refresh an expired assertion token only once."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from threading import Event
+
+    expired = {
+        "token_type": "Bearer",
+        "access_token": "old-a",
+        "expires_at": 100,
+    }
+    refresh_count = {"n": 0}
+    fetch_started = Event()
+
+    def verifier(r, **kwargs):
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        if r.url == "https://provider.test/token":
+            refresh_count["n"] += 1
+            fetch_started.set()
+            time.sleep(0.2)
+            assert "assertion=" in r.body
+            resp.json = lambda: token
+        else:
+            resp.json = lambda: {"ok": True}
+        return resp
+
+    sess = AssertionSession(
+        "https://provider.test/token",
+        issuer="foo",
+        subject="foo",
+        audience="foo",
+        alg="HS256",
+        key=hmac_key,
+        token=expired,
+    )
+    sess.send = verifier
+
+    workers = 8
+    start = Barrier(workers)
+
+    def worker(index):
+        start.wait()
+        if index != 0:
+            fetch_started.wait()
+        return sess.get("https://resource.test/user")
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(worker, range(workers)))
+
+    assert refresh_count["n"] == 1
+    assert all(resp.status_code == 200 for resp in results)
+    assert sess.token["access_token"] == token["access_token"]

@@ -1,3 +1,5 @@
+import threading
+
 from authlib.common.encoding import to_native
 from authlib.oauth2.base import OAuth2Error
 from authlib.oauth2.client import _load_token_response
@@ -58,6 +60,11 @@ class AssertionClient:
         self._kwargs = kwargs
         self.leeway = leeway
 
+        # Synchronizes threads so concurrent requests refresh an expired
+        # assertion token only once. Reentrant to stay deadlock-free when a
+        # refresh triggers another locked operation on the same thread.
+        self._token_refresh_lock = threading.RLock()
+
     @property
     def token(self):
         return self.token_auth.token
@@ -90,6 +97,18 @@ class AssertionClient:
             data["client_id"] = self.client_id
 
         return self._refresh_token(data)
+
+    def ensure_active_token(self):
+        """Refresh an expired or missing assertion token once per rotation.
+
+        Concurrent threads serialize on the refresh lock and re-check the
+        token afterwards, so only the first thread performs the token
+        request; the others reuse the token it obtained.
+        """
+        with self._token_refresh_lock:
+            if self.token and not self.token.is_expired(leeway=self.leeway):
+                return self.token
+            return self.refresh_token()
 
     def parse_response_token(self, resp):
         token = _load_token_response(resp)
